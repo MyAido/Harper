@@ -1,0 +1,11 @@
+target
+build
+.idea
+.vscode
+.DS_Store
+*.pdf
+node_modules
+mariadb_data
+
+# Ignore direnv files
+.direnv/*

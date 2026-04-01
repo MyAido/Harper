@@ -1,0 +1,369 @@
+import type { LintOptions } from 'harper.js';
+import { closestBox, type IgnorableLintBox } from './Box';
+import computeLintBoxes from './computeLintBoxes';
+import { isHeading, isVisible } from './domUtils';
+import { getCaretPosition, getCMRoot } from './editorUtils';
+import Highlights from './Highlights';
+import PopupHandler from './PopupHandler';
+import type { UnpackedLint, UnpackedLintGroups } from './unpackLint';
+
+type ActivationKey = 'off' | 'shift' | 'control';
+
+type Modifier = 'Ctrl' | 'Shift' | 'Alt';
+
+type Hotkey = {
+	modifiers: Modifier[];
+	key: string;
+};
+
+/** Events on an input (any kind) that can trigger a re-render. */
+const INPUT_EVENTS = ['focus', 'keyup', 'paste', 'change', 'scroll'];
+/** Events on the window that can trigger a re-render. */
+const PAGE_EVENTS = ['resize', 'scroll'];
+
+/** Orchestrates linting and rendering in response to events on the page. */
+export default class LintFramework {
+	private highlights: Highlights;
+	private popupHandler: PopupHandler;
+	private targets: Set<Node>;
+	private scrollableAncestors: Set<HTMLElement>;
+	private lintRequested = false;
+	private renderRequested = false;
+	private lastLints: { target: HTMLElement; lints: UnpackedLintGroups }[] = [];
+	private lastBoxes: IgnorableLintBox[] = [];
+	private lastLintBoxes: IgnorableLintBox[] = [];
+
+	/** The function to be called to re-render the highlights. This is a variable because it is used to register/deregister event listeners. */
+	private updateEventCallback: () => void;
+
+	/** Function used to fetch lints for a given text/domain. */
+	private lintProvider: (
+		text: string,
+		domain: string,
+		options?: LintOptions,
+	) => Promise<UnpackedLintGroups>;
+	/** Actions wired by host environment (extension/app). */
+	private actions: {
+		ignoreLint?: (hash: string) => Promise<void>;
+		getActivationKey?: () => Promise<ActivationKey>;
+		getHotkey?: () => Promise<Hotkey>;
+		openOptions?: () => Promise<void>;
+		addToUserDictionary?: (words: string[]) => Promise<void>;
+		reportError?: (lint: UnpackedLint, ruleId: string) => Promise<void>;
+		setRuleEnabled?: (ruleId: string, enabled: boolean) => Promise<void> | void;
+	};
+
+	constructor(
+		lintProvider: (
+			text: string,
+			domain: string,
+			options?: LintOptions,
+		) => Promise<UnpackedLintGroups>,
+		actions: {
+			ignoreLint?: (hash: string) => Promise<void>;
+			getActivationKey?: () => Promise<ActivationKey>;
+			getHotkey?: () => Promise<Hotkey>;
+			openOptions?: () => Promise<void>;
+			addToUserDictionary?: (words: string[]) => Promise<void>;
+			reportError?: (lint: UnpackedLint, ruleId: string) => Promise<void>;
+			setRuleEnabled?: (ruleId: string, enabled: boolean) => Promise<void> | void;
+		},
+	) {
+		this.lintProvider = lintProvider;
+		this.actions = actions;
+		this.highlights = new Highlights();
+		this.popupHandler = new PopupHandler({
+			getActivationKey: actions.getActivationKey,
+			openOptions: actions.openOptions,
+			addToUserDictionary: actions.addToUserDictionary,
+			reportError: actions.reportError,
+			setRuleEnabled: actions.setRuleEnabled,
+		});
+		this.targets = new Set();
+		this.scrollableAncestors = new Set();
+		this.lastLints = [];
+
+		this.updateEventCallback = () => {
+			this.update();
+		};
+
+		const timeoutCallback = () => {
+			this.update();
+
+			setTimeout(timeoutCallback, 100);
+		};
+
+		timeoutCallback();
+
+		this.attachWindowListeners();
+	}
+
+	/** Returns the currents targets that are visible on-screen. */
+	onScreenTargets(): Node[] {
+		const onScreen = [] as Node[];
+
+		for (const target of this.targets) {
+			if (isVisible(target)) {
+				onScreen.push(target);
+			}
+		}
+
+		return onScreen;
+	}
+
+	async update() {
+		this.requestRender();
+		this.requestLintUpdate();
+	}
+
+	async requestLintUpdate() {
+		if (this.lintRequested) {
+			return;
+		}
+
+		// Avoid duplicate requests in the queue
+		this.lintRequested = true;
+
+		const lintResults = await Promise.all(
+			this.onScreenTargets().map(async (target) => {
+				if (!document.contains(target)) {
+					this.targets.delete(target);
+					return { target: null as HTMLElement | null, lints: {} };
+				}
+
+				let text = null;
+
+				// Check if it is a CodeMirror instance, which needs to be handled in a specific way.
+				const isCM = target instanceof HTMLElement && getCMRoot(target) != null;
+
+				if (isCM) {
+					const lineElements = target.querySelectorAll<HTMLElement>('.cm-line');
+					const lines = Array.from(lineElements).map((el) => el.textContent);
+					text = lines.reduce((acc: string, x: string) => `${acc + x}\n`, '');
+				} else {
+					text =
+						target instanceof HTMLTextAreaElement || target instanceof HTMLInputElement
+							? target.value
+							: target.textContent;
+				}
+
+				const newLineIndices = [];
+				let i = 0;
+				for (const c of text ?? '') {
+					if (c == '\n') {
+						newLineIndices.push(i);
+					}
+					i++;
+				}
+
+				if (!text || text.length > 120000) {
+					return { target: null as HTMLElement | null, lints: {} };
+				}
+
+				const language = getTargetLanguage(target);
+				let lintsBySource = await this.lintProvider(text, window.location.hostname, {
+					forceAllHeadings: isHeading(target),
+					language,
+				});
+
+				if (isCM) {
+					// We're about to modify a reference, so let's work on a copy.
+					lintsBySource = window.structuredClone(lintsBySource);
+
+					for (const lints of Object.values(lintsBySource)) {
+						for (const lint of lints) {
+							const offset_start = newLineIndices.findIndex((i) => i > lint.span.start);
+							const offset_end = newLineIndices.findIndex((i) => i > lint.span.end);
+
+							lint.span.start -= offset_start;
+							lint.span.end -= offset_end;
+						}
+					}
+				}
+
+				return { target: target as HTMLElement, lints: lintsBySource };
+			}),
+		);
+
+		this.lastLints = lintResults.filter((r) => r.target != null) as any;
+		this.lintRequested = false;
+		this.requestRender();
+	}
+
+	/**
+	 * Hotkey to apply the suggestion of the most likely word
+	 */
+	public async lintHotkey() {
+		const hotkey = await this.actions.getHotkey?.();
+
+		document.addEventListener(
+			'keydown',
+			(event: KeyboardEvent) => {
+				if (!hotkey) return;
+
+				const key = event.key.toLowerCase();
+				const expectedKey = hotkey.key.toLowerCase();
+
+				const hasCtrl = event.ctrlKey === hotkey.modifiers.includes('Ctrl');
+				const hasAlt = event.altKey === hotkey.modifiers.includes('Alt');
+				const hasShift = event.shiftKey === hotkey.modifiers.includes('Shift');
+
+				const match = key === expectedKey && hasCtrl && hasAlt && hasShift;
+
+				if (match) {
+					event.preventDefault();
+					event.stopImmediatePropagation();
+
+					const caretPosition = getCaretPosition();
+
+					if (caretPosition != null) {
+						const closestIdx = closestBox(caretPosition, this.lastBoxes);
+
+						const previousBox = this.lastBoxes[closestIdx];
+						const suggestions = previousBox.lint.suggestions;
+						if (suggestions.length > 0) {
+							previousBox.applySuggestion(suggestions[0]);
+						} else {
+							previousBox.ignoreLint?.();
+						}
+					}
+				}
+			},
+			{ capture: true },
+		);
+	}
+
+	public async addTarget(target: Node) {
+		if (!this.targets.has(target)) {
+			this.targets.add(target);
+			this.update();
+			this.attachTargetListeners(target);
+		}
+	}
+
+	public async removeTarget(target: HTMLElement) {
+		if (this.targets.has(target)) {
+			this.targets.delete(target);
+			this.update();
+			this.detachTargetListeners(target);
+		} else {
+			throw new Error('HTMLElement not added.');
+		}
+	}
+
+	/** Return the last known ignorable lint boxes rendered on-screen. */
+	public getLastIgnorableLintBoxes(): IgnorableLintBox[] {
+		return this.lastLintBoxes;
+	}
+
+	private attachTargetListeners(target: Node) {
+		for (const event of INPUT_EVENTS) {
+			target.addEventListener(event, this.updateEventCallback);
+		}
+
+		const observer = new MutationObserver(this.updateEventCallback);
+		const config = { subtree: true, characterData: true };
+
+		if ((target as any).tagName == undefined) {
+			observer.observe((target as any).parentElement!, config);
+		} else {
+			observer.observe(target as Element, config);
+		}
+
+		const scrollableAncestors = getScrollableAncestors(target);
+
+		for (const el of scrollableAncestors) {
+			if (!this.scrollableAncestors.has(el as HTMLElement)) {
+				this.scrollableAncestors.add(el as HTMLElement);
+				(el as HTMLElement).addEventListener('scroll', this.updateEventCallback, {
+					capture: true,
+					passive: true,
+				});
+			}
+		}
+	}
+
+	private detachTargetListeners(target: HTMLElement) {
+		for (const event of INPUT_EVENTS) {
+			target.removeEventListener(event, this.updateEventCallback);
+		}
+	}
+
+	private attachWindowListeners() {
+		this.lintHotkey();
+		for (const event of PAGE_EVENTS) {
+			window.addEventListener(event, this.updateEventCallback);
+		}
+	}
+
+	private requestRender() {
+		if (this.renderRequested) {
+			return;
+		}
+
+		this.renderRequested = true;
+
+		requestAnimationFrame(() => {
+			const boxes = this.lastLints.flatMap(({ target, lints }) =>
+				target
+					? Object.entries(lints).flatMap(([ruleName, ls]) =>
+							ls.flatMap((l) =>
+								computeLintBoxes(target, l as any, ruleName, {
+									ignoreLint: this.actions.ignoreLint,
+								}),
+							),
+						)
+					: [],
+			);
+			this.lastLintBoxes = boxes;
+			this.highlights.renderLintBoxes(boxes);
+			this.popupHandler.updateLintBoxes(boxes);
+
+			this.renderRequested = false;
+			this.lastBoxes = boxes;
+		});
+	}
+}
+
+/**
+ * Returns all scrollable ancestor elements of a given element,
+ * ordered from nearest to furthest (ending with the page scroller).
+ */
+function getScrollableAncestors(element: Node): Element[] {
+	const scrollables: Element[] = [];
+	const root = document.scrollingElement || document.documentElement;
+	let parent = (element as any).parentElement;
+
+	while (parent) {
+		const style = window.getComputedStyle(parent);
+		const { overflowY, overflowX } = style;
+		const canScrollY = overflowY.includes('auto') || overflowY.includes('scroll');
+		const canScrollX = overflowX.includes('auto') || overflowX.includes('scroll');
+
+		if (canScrollY || canScrollX) {
+			scrollables.push(parent);
+		}
+		parent = parent.parentElement;
+	}
+
+	// Always include the document scroller at the end
+	if (root && scrollables[scrollables.length - 1] !== root) {
+		scrollables.push(root);
+	}
+
+	return scrollables;
+}
+
+function getTargetLanguage(target: Node): LintOptions['language'] | undefined {
+	if (!(target instanceof Element)) return undefined;
+
+	const language = target.getAttribute('data-language');
+	switch (language) {
+		case 'plaintext':
+		case 'markdown':
+		case 'typst':
+			return language;
+		default:
+			return undefined;
+	}
+}

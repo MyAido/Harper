@@ -1,0 +1,25 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="utf-8">
+    <script>
+        // Catch synchronous/non-module errors
+        window.onerror = function(message, source, lineno, colno, error) {
+            var msg = message + ' @ ' + source + ':' + lineno;
+            console.error('GLOBAL ERROR: ' + msg);
+            if (window.Android && window.Android.onEngineError) {
+                window.Android.onEngineError(msg);
+            }
+            return true;
+        };
+    </script>
+</head>
+<body>
+    <!--
+        IMPORTANT: type="module" is required so that import.meta.url
+        resolves to the correct file:// path. This lets harper.js
+        locate its WASM binary correctly.
+    -->
+    <script type="module" src="bundle.js"></script>
+</body>
+</html>
